@@ -54,17 +54,17 @@ This is a high-reliability microservice pipeline developed for **UM6P Africa Bus
 
 ### 2. 🔧 Environment Setup
 
-# Clone repo
+#### Clone repo
 git clone 
 cd ABS-elevate
 
-# Create virtual environment
+#### Create virtual environment
 python -m venv venv && source venv/bin/activate
 
-# Install dependencies
+#### Install dependencies
 pip install -r requirements.txt
 
-# Export environment variables
+#### Export environment variables
 export ACCESS_TOKEN="your_secure_token_here"
 export RABBITMQ_HOST="localhost"
 export RABBITMQ_USER="guest"
@@ -75,19 +75,19 @@ export OPENAI_API_KEY="your_key"
 ### 3. ▶️ Run API Server
 
 uvicorn main:app --reload
-# API will be accessible at:
+#### API will be accessible at:
 http://localhost:8000/api/videos
 
 ### 4. 🧪 Example Submission (via curl)
 
-# File Upload
+#### File Upload
 curl -X POST http://localhost:8000/api/videos \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -F "video=@/path/to/video.mp4" \
   -F "preferred_languages=fr,es" \
   -F "callback_url=https://client.app/callback"
 
-# URL Reference
+#### URL Reference
 curl -X POST http://localhost:8000/api/videos \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -F "video_url=https://domain.com/video.mp4" \
@@ -96,7 +96,7 @@ curl -X POST http://localhost:8000/api/videos \
 
 ### 🔄 Background Workers (To Be Implemented)
 
-# Each worker will:
+#### Each worker will:
 
 Consume jobs from RabbitMQ
 Run captioning.py, translation.py, and auto_chapters.py
