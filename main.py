@@ -1,45 +1,140 @@
-import os
-import uuid
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
-import redis
-from rq import Queue
-import worker  # Import the worker module with the processing function
+from typing import List, Optional
+import shutil
+import uuid
+import os
+from datetime import datetime
 
-# Load secure token from environment variable or configuration.
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "YOUR_SECURE_TOKEN")
+from config import ACCESS_TOKEN
+from job_queue import enqueue_job  # Import the enqueue function
 
-# Setup Redis connection and create an RQ queue.
-redis_conn = redis.Redis(host="localhost", port=6379, db=0)
-job_queue = Queue(connection=redis_conn)
+# Initialize FastAPI app
+app = FastAPI(title="MAP Project API Gateway with Job Queue Integration")
 
-app = FastAPI(title="ABS Elevate Video Processing API (RQ)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class VideoSubmission(BaseModel):
-    video_url: HttpUrl
-    callback_url: HttpUrl
 
-@app.post("/submit_video")
-async def submit_video(submission: VideoSubmission, authorization: str = Header(...)):
+# ------------------------------
+# Middleware / Dependencies
+# ------------------------------
+
+def verify_access_token(authorization: Optional[str] = Header(None)):
     """
-    Submit a video for processing. Request must include a Bearer access token.
-    JSON payload should contain a video_url and a callback_url.
+    Dependency to verify the request has a valid access token in the header "Authorization".
+    The expected format: "Bearer <token>".
     """
-    if authorization != f"Bearer {ACCESS_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="Authorization header missing")
+    
+    try:
+        scheme, token = authorization.split()
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    
+    if scheme.lower() != "bearer" or token != ACCESS_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid or missing access token")
+    return token
 
-    # Generate a unique job ID.
+
+# ------------------------------
+# Pydantic Models for Metadata
+# ------------------------------
+
+class VideoMetadata(BaseModel):
+    video_url: Optional[HttpUrl] = None  # Optional URL if a file is not uploaded
+    preferred_languages: List[str] = ["en"]  # Defaults to English; valid entries: en, fr, es, ar.
+    callback_url: Optional[HttpUrl] = None  # Callback URL for processing completion notification
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "video_url": "https://example.com/path/to/video.mp4",
+                "preferred_languages": ["en", "fr"],
+                "callback_url": "https://yourdomain.com/callback"
+            }
+        }
+
+
+# ------------------------------
+# Utility Function: Save Uploaded File
+# ------------------------------
+
+def save_upload_file(upload_file: UploadFile, destination: str) -> None:
+    """
+    Saves the uploaded file to the specified destination.
+    Consider integrating AWS S3 for production storage.
+    """
+    with open(destination, "wb") as buffer:
+        shutil.copyfileobj(upload_file.file, buffer)
+
+
+# ------------------------------
+# API Endpoints
+# ------------------------------
+
+@app.post("/api/videos", dependencies=[Depends(verify_access_token)])
+async def upload_video(
+    # Accept file upload (optional)
+    video: Optional[UploadFile] = File(None),
+    # Accept metadata as form data fields
+    video_url: Optional[str] = Form(None),
+    preferred_languages: List[str] = Form(...),
+    callback_url: str = Form(...),
+):
+    """
+    Endpoint to accept video submissions.
+    
+    Either a video file upload (using "video") or a video URL (using "video_url") must be provided.
+    Also accepts a list of preferred languages and a callback URL.
+    
+    Returns a JSON response with the job identifier.
+    """
+    if video is None and video_url is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Either a video file or a video URL must be provided"
+        )
+
     job_id = str(uuid.uuid4())
 
-    # Enqueue the processing task using RQ.
-    job = job_queue.enqueue(worker.process_video, submission.video_url, submission.callback_url, job_id)
+    # Set up local temporary storage
+    temp_dir = "temp_uploads"
+    os.makedirs(temp_dir, exist_ok=True)
 
-    return {
+    saved_file_path = None
+
+    if video is not None:
+        file_extension = os.path.splitext(video.filename)[1]
+        saved_file_path = os.path.join(temp_dir, f"{job_id}{file_extension}")
+        try:
+            save_upload_file(video, saved_file_path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to save uploaded file: {str(e)}"
+            )
+    else:
+        saved_file_path = video_url  # For video URLs, you may optionally download the file if needed.
+
+    # Create job payload with metadata
+    job_payload = {
         "job_id": job_id,
-        "rq_job_id": job.get_id(),
-        "status": "Processing started"
+        "file_path": saved_file_path,
+        "preferred_languages": preferred_languages,
+        "callback_url": callback_url,
+        "submission_time": datetime.utcnow().isoformat() + "Z"
     }
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    try:
+        enqueue_job(job_payload)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {str(e)}")
+
+    return {"job_id": job_id, "message": "Video submission accepted. Processing started."}

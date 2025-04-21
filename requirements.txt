@@ -1,6 +1,6 @@
-fastapi 
-uvicorn 
-redis 
-rq 
-requests 
-pydantic
+fastapi
+uvicorn
+python-multipart
+pika
+requests
+openai
