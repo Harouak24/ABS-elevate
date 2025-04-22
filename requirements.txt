@@ -3,4 +3,6 @@ uvicorn
 python-multipart
 pika
 requests
+assemblyai
 openai
+boto3

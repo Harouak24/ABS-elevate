@@ -1,17 +1,21 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-from typing import List, Optional
-import shutil
-import uuid
 import os
+import uuid
 from datetime import datetime
+from fastapi import (
+    FastAPI, File, UploadFile, HTTPException, Header,
+    BackgroundTasks, Depends, Body
+)
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl, validator
+from typing import List, Optional
+from config import (
+    ACCESS_TOKEN,
+    TEMP_UPLOAD_DIR,
+    ALLOWED_LANGUAGES,
+)
+from job_queue import enqueue_job
 
-from config import ACCESS_TOKEN
-from job_queue import enqueue_job  # Import the enqueue function
-
-# Initialize FastAPI app
-app = FastAPI(title="MAP Project API Gateway with Job Queue Integration")
+app = FastAPI(title="MAP Video Ingestion")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,119 +26,86 @@ app.add_middleware(
 )
 
 
-# ------------------------------
-# Middleware / Dependencies
-# ------------------------------
+# --- Dependencies & Auth --- #
 
 def verify_access_token(authorization: Optional[str] = Header(None)):
-    """
-    Dependency to verify the request has a valid access token in the header "Authorization".
-    The expected format: "Bearer <token>".
-    """
-    if authorization is None:
-        raise HTTPException(status_code=401, detail="Authorization header missing")
-    
-    try:
-        scheme, token = authorization.split()
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization format")
-    
+    if not authorization:
+        raise HTTPException(401, "Authorization header missing")
+    scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or token != ACCESS_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid or missing access token")
-    return token
+        raise HTTPException(403, "Invalid or missing access token")
 
 
-# ------------------------------
-# Pydantic Models for Metadata
-# ------------------------------
+# --- Request Model --- #
 
-class VideoMetadata(BaseModel):
-    video_url: Optional[HttpUrl] = None  # Optional URL if a file is not uploaded
-    preferred_languages: List[str] = ["en"]  # Defaults to English; valid entries: en, fr, es, ar.
-    callback_url: Optional[HttpUrl] = None  # Callback URL for processing completion notification
+class VideoRequest(BaseModel):
+    video_url: Optional[HttpUrl] = None
+    preferred_languages: List[str]
+    callback_url: HttpUrl
 
-    class Config:
-        schema_extra = {
-            "example": {
-                "video_url": "https://example.com/path/to/video.mp4",
-                "preferred_languages": ["en", "fr"],
-                "callback_url": "https://yourdomain.com/callback"
-            }
-        }
+    @validator("preferred_languages", each_item=True)
+    def check_language(cls, v):
+        if v not in ALLOWED_LANGUAGES:
+            raise ValueError(f"Unsupported language: {v}")
+        return v
 
-
-# ------------------------------
-# Utility Function: Save Uploaded File
-# ------------------------------
-
-def save_upload_file(upload_file: UploadFile, destination: str) -> None:
-    """
-    Saves the uploaded file to the specified destination.
-    Consider integrating AWS S3 for production storage.
-    """
-    with open(destination, "wb") as buffer:
-        shutil.copyfileobj(upload_file.file, buffer)
+    @validator("video_url", always=True)
+    def require_file_or_url(cls, v, values):
+        # We require either a URL or a File upload; File handled separately
+        if not v and not values.get("_file_upload_included"):
+            raise ValueError("Either video_url or a file upload must be provided")
+        return v
 
 
-# ------------------------------
-# API Endpoints
-# ------------------------------
+# --- Endpoint --- #
 
-@app.post("/api/videos", dependencies=[Depends(verify_access_token)])
+@app.post(
+    "/api/videos",
+    dependencies=[Depends(verify_access_token)],
+    status_code=202,
+    summary="Submit a video for captioning, translation, and auto-chapterning"
+)
 async def upload_video(
-    # Accept file upload (optional)
+    background_tasks: BackgroundTasks,
+    payload: VideoRequest = Body(...),
     video: Optional[UploadFile] = File(None),
-    # Accept metadata as form data fields
-    video_url: Optional[str] = Form(None),
-    preferred_languages: List[str] = Form(...),
-    callback_url: str = Form(...),
 ):
     """
-    Endpoint to accept video submissions.
-    
-    Either a video file upload (using "video") or a video URL (using "video_url") must be provided.
-    Also accepts a list of preferred languages and a callback URL.
-    
-    Returns a JSON response with the job identifier.
+    Submit either a direct file upload or a public video URL, specify target
+    languages, and a callback URL. Returns a job_id immediately.
     """
-    if video is None and video_url is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Either a video file or a video URL must be provided"
-        )
+    # Ensure temp dir exists
+    os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
 
     job_id = str(uuid.uuid4())
+    submission_ts = datetime.utcnow().isoformat() + "Z"
 
-    # Set up local temporary storage
-    temp_dir = "temp_uploads"
-    os.makedirs(temp_dir, exist_ok=True)
-
-    saved_file_path = None
-
-    if video is not None:
-        file_extension = os.path.splitext(video.filename)[1]
-        saved_file_path = os.path.join(temp_dir, f"{job_id}{file_extension}")
+    # Handle file upload vs URL
+    if video:
+        ext = os.path.splitext(video.filename)[1]
+        saved_path = os.path.join(TEMP_UPLOAD_DIR, f"{job_id}{ext}")
         try:
-            save_upload_file(video, saved_file_path)
+            with open(saved_path, "wb") as buf:
+                import shutil
+                shutil.copyfileobj(video.file, buf)
         except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to save uploaded file: {str(e)}"
-            )
+            raise HTTPException(500, f"Failed to save upload: {e}")
     else:
-        saved_file_path = video_url  # For video URLs, you may optionally download the file if needed.
+        saved_path = str(payload.video_url)
 
-    # Create job payload with metadata
-    job_payload = {
+    # Build job payload
+    job = {
         "job_id": job_id,
-        "file_path": saved_file_path,
-        "preferred_languages": preferred_languages,
-        "callback_url": callback_url,
-        "submission_time": datetime.utcnow().isoformat() + "Z"
+        "file_path": saved_path,
+        "preferred_languages": payload.preferred_languages,
+        "callback_url": str(payload.callback_url),
+        "submission_time": submission_ts,
     }
 
-    try:
-        enqueue_job(job_payload)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {str(e)}")
+    # Enqueue in background
+    background_tasks.add_task(enqueue_job, job)
 
-    return {"job_id": job_id, "message": "Video submission accepted. Processing started."}
+    return {
+        "job_id": job_id,
+        "message": "Accepted: processing will begin shortly."
+    }

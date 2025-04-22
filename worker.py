@@ -1,81 +1,131 @@
+import os
+import json
+import uuid
+import logging
 import requests
+import boto3
+from typing import Dict, Any
+import assemblyai as aai
+import openai
 
-def transcribe_video(video_url):
-    """
-    Simulate an ASR call (e.g., Deepgram/AssemblyAI) to generate SRT subtitles.
-    In production, download the video or audio and call the ASR API.
-    """
-    srt_content = (
-        "1\n"
-        "00:00:00,000 --> 00:00:05,000\n"
-        "Hello, world!\n"
-    )
-    return srt_content
+from captioning import ms_to_srt_timestamp, transcript_to_srt
+from translation import parse_srt, write_srt, translate_srt
+from auto_chapters import get_assembly_transcript, generate_llm_chapters, reconcile_chapters
+from callback_service import send_callback
 
-def auto_chapter(video_url):
-    """
-    Simulate auto-chapter generation.
-    In a production system, call the AssemblyAI auto-chapter API and/or generate chapters using an LLM.
-    """
-    chapters = [
-        {"start": "00:00:00,000", "end": "00:05:00,000", "title": "Introduction"},
-        {"start": "00:05:00,000", "end": "00:10:00,000", "title": "Main Content"}
-    ]
-    return chapters
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def translate_srt(srt_content, target_language):
-    """
-    Simulate translating an SRT file into the target language while preserving timestamps.
-    A real implementation would parse the file, translate text lines, and then rebuild the file.
-    """
-    translated_lines = []
-    for line in srt_content.splitlines():
-        # Do not translate sequence or timestamp lines.
-        if line and not line[0].isdigit() and "-->" not in line:
-            translated_lines.append(f"{line} [{target_language}]")
-        else:
-            translated_lines.append(line)
-    return "\n".join(translated_lines)
+# AWS S3 settings (ensure these env vars are set)
+S3_BUCKET = os.getenv('S3_BUCKET')
+AWS_REGION = os.getenv('AWS_REGION')
 
-def process_video(video_url, callback_url, job_id):
+# AssemblyAI & OpenAI init
+ASSEMBLYAI_API_KEY = os.getenv('ASSEMBLYAI_API_KEY')
+aai.settings.api_key = ASSEMBLYAI_API_KEY
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY') or None
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+
+# Initialize AWS S3 client
+s3_client = boto3.client('s3') if S3_BUCKET else None
+
+
+def upload_to_s3(local_path: str, s3_key: str) -> str:
     """
-    RQ worker task to process the video:
-      1. Transcribe the video to generate SRT captions.
-      2. Generate auto‑chapters.
-      3. Translate the SRT captions into multiple languages.
-      4. Notify the provided callback URL with the results.
+    Upload a local file to S3 and return its HTTPS URL.
     """
+    if not s3_client:
+        raise RuntimeError('S3_BUCKET and AWS credentials must be configured')
+    s3_client.upload_file(local_path, S3_BUCKET, s3_key)
+    return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+
+
+def download_media(source_url: str, dest_path: str) -> None:
+    """
+    Downloads media from a URL to a local path.
+    """
+    resp = requests.get(source_url, stream=True)
+    resp.raise_for_status()
+    with open(dest_path, 'wb') as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+
+def process_job(job_payload: Dict[str, Any]) -> None:
+    job_id = job_payload['job_id']
+    media_source = job_payload['file_path']
+    callback_url = job_payload['callback_url']
+    languages = job_payload.get('preferred_languages', [])
+    submitted_at = job_payload.get('submission_time')
+
     try:
-        # Step 1: Transcription using ASR.
-        srt_content = transcribe_video(video_url)
+        # 1. Download media if needed
+        local_media = media_source
+        if media_source.startswith('http'):
+            local_media = f"/tmp/{job_id}{os.path.splitext(media_source)[1]}"
+            logger.info(f"Downloading media to {local_media}...")
+            download_media(media_source, local_media)
 
-        # Step 2: Auto‑chapters generation.
-        chapters = auto_chapter(video_url)
+        # 2. Captioning
+        logger.info("Generating captions via AssemblyAI...")
+        transcriber = aai.Transcriber()
+        transcript = transcriber.transcribe(local_media)
+        words = transcript.words  # list of {'start','end','text'}
+        srt_local = f"/tmp/{job_id}.srt"
+        transcript_to_srt(words, srt_local)
+        captions_s3_key = f"{job_id}/captions/{job_id}.srt"
+        captions_url = upload_to_s3(srt_local, captions_s3_key)
 
-        # Step 3: Translation into multiple languages.
-        languages = ["en", "fr", "es", "ar"]
-        translations = {}
-        for lang in languages:
-            translations[lang] = translate_srt(srt_content, lang)
+        # 3. Auto-chapterning
+        logger.info("Generating auto-chapters via AssemblyAI & LLM...")
+        _, assembly_chaps = get_assembly_transcript(local_media)
+        llm_chaps = generate_llm_chapters(transcript.text)
+        reconciled_chaps = reconcile_chapters(assembly_chaps, llm_chaps)
+        chap_local = f"/tmp/{job_id}_chapters.json"
+        with open(chap_local, 'w', encoding='utf-8') as f:
+            json.dump(reconciled_chaps, f)
+        chapters_s3_key = f"{job_id}/chapters/{job_id}_reconciled.json"
+        chapters_url = upload_to_s3(chap_local, chapters_s3_key)
 
-        # Prepare result payload.
-        result_payload = {
-            "job_id": job_id,
-            "srt": srt_content,
-            "chapters": chapters,
-            "translations": translations
+        # 4. Translation
+        logger.info("Translating captions...")
+        entries = parse_srt(srt_local)
+        translation_urls = {}
+        for code in languages:
+            txt_entries = translate_srt(entries, code)
+            tr_local = f"/tmp/{job_id}_{code}.srt"
+            write_srt(txt_entries, tr_local)
+            tr_s3_key = f"{job_id}/translations/{job_id}_{code}.srt"
+            translation_urls[code] = upload_to_s3(tr_local, tr_s3_key)
+
+        # 5. Callback
+        results = {
+            'submitted_at': submitted_at,
+            'captions': {'source': captions_url},
+            'chapters': {'reconciled': chapters_url},
+            'translations': translation_urls
         }
-
-        # Step 4: Notify the callback URL of the results.
-        headers = {"Content-Type": "application/json"}
-        response = requests.post(callback_url, json=result_payload, headers=headers)
-        response.raise_for_status()
-        return {"status": "success", "job_id": job_id}
+        send_callback(job_id, callback_url, results, status='completed')
+        logger.info(f"Job {job_id} completed successfully.")
 
     except Exception as e:
-        error_payload = {"job_id": job_id, "error": str(e)}
-        try:
-            requests.post(callback_url, json=error_payload, headers={"Content-Type": "application/json"})
-        except Exception as inner_e:
-            print("Failed to notify callback:", inner_e)
-        raise e
+        logger.exception(f"Error processing job {job_id}")
+        send_callback(job_id, callback_url, {}, status='failed', error_message=str(e))
+        raise
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Worker for MAP video processing pipeline')
+    parser.add_argument('-j', '--job-payload', required=True,
+                        help='Path to JSON file containing the job payload')
+    args = parser.parse_args()
+    with open(args.job_payload, 'r', encoding='utf-8') as f:
+        payload = json.load(f)
+    process_job(payload)
+
+
+if __name__ == '__main__':
+    main()
